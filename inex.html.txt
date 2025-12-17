@@ -278,4 +278,5 @@ function updateUI() {
 function getRandomWeather() {
     const w = ["맑음", "황사", "정전", "한파", "홍수", "안개", "계엄령", "축제"];
     return w[Math.floor(Math.random() * w.length)];
+
 }
