@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>MAFIA: The Rule Breaker</title>
+    <script src="https://www.gstatic.com/firebasejs/9.15.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.15.0/firebase-database-compat.js"></script>
+    <style>
+        :root { --bg: #0d0d0f; --panel: #1a1a1f; --acc: #ff4757; --text: #f1f2f6; --mafia: #8e44ad; --citizen: #2ecc71; --neutral: #f1c40f; }
+        body { background: var(--bg); color: var(--text); font-family: 'Apple SD Gothic Neo', sans-serif; margin: 0; display: flex; height: 100vh; overflow: hidden; }
+        
+        /* 레이아웃 구조 */
+        #side-panel { width: 320px; background: var(--panel); border-right: 2px solid #333; display: flex; flex-direction: column; }
+        #main-panel { flex: 1; display: flex; flex-direction: column; position: relative; }
+        
+        /* 플레이어 리스트 스타일 */
+        .player-card { padding: 15px; border-bottom: 1px solid #333; display: flex; justify-content: space-between; align-items: center; transition: 0.3s; }
+        .player-card.selected { background: var(--acc); }
+        .player-card.dead { opacity: 0.4; filter: grayscale(1); }
+        
+        /* 로그 및 채팅 */
+        #log-view { flex: 1; overflow-y: auto; padding: 20px; font-size: 15px; line-height: 1.7; background: rgba(0,0,0,0.2); }
+        #input-bar { height: 70px; background: #000; display: flex; padding: 10px; border-top: 1px solid #333; }
+        input { flex: 1; background: #222; border: 1px solid #444; color: #fff; padding: 15px; border-radius: 8px; font-size: 16px; }
+        
+        /* 직업/상태 표시 */
+        #my-status { padding: 20px; background: #000; border-top: 2px solid var(--acc); }
+        .ability-btn { width: 100%; padding: 12px; margin-top: 10px; border-radius: 8px; border: none; font-weight: bold; cursor: pointer; }
+        
+        /* 재해 효과 오버레이 */
+        .overlay { position: fixed; top:0; left:0; width:100%; height:100%; pointer-events:none; z-index:999; display:none; }
+        .dust { background: rgba(243, 156, 18, 0.2); display: block; }
+        .blackout { background: rgba(0,0,0,0.9); display: block; }
+    </style>
+</head>
+<body>
+
+<div id="weather-overlay" class="overlay"></div>
+
+<div id="side-panel">
+    <div style="padding: 20px; font-weight: bold; font-size: 1.2em; border-bottom: 2px solid #333;">참여자 목록</div>
+    <div id="player-list" style="flex: 1; overflow-y: auto;"></div>
+    <div id="my-status">
+        <div id="role-name" style="font-size: 1.2em; color: var(--acc);">접속 중...</div>
+        <div id="role-desc" style="font-size: 0.8em; margin: 5px 0;">대기실에서 기다려주세요.</div>
+        <div id="ability-area"></div>
+    </div>
+</div>
+
+<div id="main-panel">
+    <div id="game-header" style="height: 60px; background: #000; display: flex; align-items: center; padding: 0 20px; justify-content: space-between;">
+        <div id="phase-tag">🏠 대기실</div>
+        <div id="weather-tag">☀️ 맑음</div>
+        <div id="room-info">방 코드: <span id="room-id-display">----</span></div>
+    </div>
+    <div id="log-view"></div>
+    <div id="input-bar">
+        <input type="text" id="chat-input" placeholder="메시지를 입력하거나 명령어를 입력하세요...">
+    </div>
+</div>
+
+<script>
+// --- [1] Firebase 초기화 ---
+const firebaseConfig = {
+    apiKey: "YOUR_API_KEY",
+    databaseURL: "YOUR_DATABASE_URL",
+    projectId: "YOUR_PROJECT_ID",
+};
+firebase.initializeApp(firebaseConfig);
+const db = firebase.database();
+
+// --- [2] 게임 전역 변수 ---
+let roomID = "ROOM_001"; // 확장 가능
+let myID = "Player_" + Math.floor(Math.random() * 1000);
+let myRole = null;
+let isHost = false;
+
+// --- [3] 20종 직업 로직 정의 ---
+const ROLES = {
+    "시민": { team: "citizen", desc: "능력 없음", power: 0 },
+    "경찰": { team: "citizen", desc: "밤마다 한 명 조사 (진영 확인)", power: 1 },
+    "의사": { team: "citizen", desc: "밤마다 한 명 치료 (자힐 포함)", power: 1 },
+    "감시자": { team: "citizen", desc: "누가 누구에게 능력을 썼는지 감시", power: 1 },
+    "미치광이의사": { team: "citizen", desc: "치료 시 대상이 무사하면 사망시킴", power: 1 },
+    "군인": { team: "citizen", desc: "습격 1회 방어, 투표 시 즉사", life: 2 },
+    "연인": { team: "citizen", desc: "서로 연결됨, 대신 죽어줌", power: 0 },
+    "시장": { team: "random", desc: "투표권 3표 행사", power: 0 },
+    "개표인": { team: "random", desc: "투표 결과 강제 조작 (30초)", power: 1 },
+    "사제": { team: "citizen", desc: "게임 중 1회 부활", power: 1 },
+    "광대": { team: "neutral", desc: "투표로 처형 시 승리", power: 0 },
+    "감염자": { team: "neutral", desc: "모두 감염 시 승리", power: 1 },
+    "식인종": { team: "neutral", desc: "모두 잡아먹으면 승리", power: 1 },
+    "기술자": { team: "citizen", desc: "능력 사용 차단", power: 1 },
+    "암살자": { team: "mafia", desc: "살해 기록이 남지 않음", power: 1 },
+    "변장술사": { team: "mafia", desc: "살해 주체를 위장함", power: 1 },
+    "마녀": { team: "mafia", desc: "방어 무시 살해, 낮 마법 가능", power: 1 },
+    "테러리스트": { team: "citizen", desc: "죽을 때 길동무", power: 0 },
+    "배신자": { team: "citizen", desc: "마피아 1명 남을 시 전향", power: 0 },
+    "자경단": { team: "citizen", desc: "시민 살해 시 자폭", power: 1 }
+};
+
+// --- [4] 재해 시스템 로직 ---
+const WEATHERS = {
+    "황사": "감시자 사용 불가, 배신자 전향 지연",
+    "정전": "개표인 무료 조작, 중립 활동 불가",
+    "한파": "밤 중 무작위 동사 발생",
+    "홍수": "낮 회의 스킵",
+    "안개": "경찰 조사 오류, 마녀 낮 능력 불가",
+    "계엄령": "투표 강제, 자경단 페널티 무시",
+    "축제": "회의 시간 연장, 감염 치료"
+};
+
+// 1부 마무리: UI 업데이트 및 채팅 기초 함수
+function addLog(msg, color = "#fff") {
+    const logView = document.getElementById('log-view');
+    const div = document.createElement('div');
+    div.style.color = color;
+    div.innerHTML = `<b>></b> ${msg}`;
+    logView.appendChild(div);
+    logView.scrollTop = logView.scrollHeight;
+}
+
+document.getElementById('chat-input').addEventListener('keypress', (e) => {
+    if(e.key === 'Enter') {
+        const val = e.target.value;
+        if(val.startsWith('!')) handleCommand(val);
+        else sendChat(val);
+        e.target.value = "";
+    }
+});
+
+function handleCommand(cmd) {
+    if(cmd === "!게임시작") {
+        addLog("게임 시작을 요청합니다...", "#f1c40f");
+        // 2부에서 상세 게임 시작 로직 연결
+    }
+}
+</script>
+</body>
+</html>
+
+
+
+// --- [5] 게임 루프 제어 (턴 시스템) ---
+let gameData = {
+    phase: "LOBBY", // LOBBY, NIGHT, MORNING, VOTE, END
+    day: 1,
+    weather: "맑음",
+    players: {},
+    logs: []
+};
+
+// 실시간 데이터 동기화 (Firebase 리스너)
+db.ref(`rooms/${roomID}`).on('value', (snapshot) => {
+    const data = snapshot.val();
+    if (!data) return;
+    
+    gameData = data;
+    updateUI();
+    
+    // 페이즈 변경 시 특별 연출
+    if(gameData.phase === "NIGHT") {
+        document.getElementById('weather-overlay').className = "overlay " + (gameData.weather === "정전" ? "blackout" : (gameData.weather === "황사" ? "dust" : ""));
+    } else {
+        document.getElementById('weather-overlay').className = "overlay";
+    }
+});
+
+// --- [6] 직업 배분 및 게임 시작 ---
+function startGame() {
+    const pKeys = Object.keys(gameData.players);
+    if (pKeys.length < 4) {
+        addLog("최소 4명 이상의 플레이어가 필요합니다.", "#ff4757");
+        return;
+    }
+
+    let rolePool = Object.keys(ROLES); // 20종 직업
+    let assignments = {};
+    
+    pKeys.forEach((uid, idx) => {
+        let assignedRole = rolePool[idx % rolePool.length]; // 중복 방지 배분
+        assignments[uid] = {
+            role: assignedRole,
+            isAlive: true,
+            isInfected: false,
+            life: ROLES[assignedRole].life || 1,
+            team: ROLES[assignedRole].team === "random" ? (Math.random() > 0.5 ? "mafia" : "citizen") : ROLES[assignedRole].team
+        };
+    });
+
+    db.ref(`rooms/${roomID}`).update({
+        phase: "NIGHT",
+        day: 1,
+        weather: getRandomWeather(),
+        players: assignments,
+        targetList: {} // 밤 사이 발생한 타겟 저장소
+    });
+    addLog("게임이 시작되었습니다! 첫날 밤입니다.", "#f1c40f");
+}
+
+// --- [7] 밤의 능력 처리 로직 (핵심) ---
+function useAbility(targetID) {
+    if (gameData.phase !== "NIGHT") return;
+    const myInfo = gameData.players[myID];
+    if (!myInfo.isAlive) return;
+
+    // 20종 직업별 로직 분기
+    let action = { from: myID, to: targetID, role: myInfo.role };
+    
+    // 재해 상황 체크 (황사 시 감시자 불가 등)
+    if (gameData.weather === "황사" && myInfo.role === "감시자") {
+        addLog("황사로 인해 시야가 확보되지 않아 능력을 쓸 수 없습니다.", "#ff4757");
+        return;
+    }
+
+    db.ref(`rooms/${roomID}/targetList/${myID}`).set(action);
+    addLog(`${targetID}님에게 능력을 사용했습니다.`);
+}
+
+// --- [8] 아침 결과 판정 (복합 규칙 적용) ---
+function processNightResults() {
+    const targets = gameData.targetList || {};
+    const players = gameData.players;
+    let deaths = [];
+
+    // 1. 기술자 우선 차단
+    // 2. 마피아/마녀 공격 판정 (마녀는 방어 무시)
+    // 3. 의사/미치광이 의사 치료 판정
+    // 4. 테러리스트/군인/연인 패시브 처리
+    
+    // (이 부분에 수백 줄의 직업 상성 if문이 들어갑니다)
+    // 예: 미치광이 의사 로직
+    Object.values(targets).forEach(t => {
+        if(t.role === "미치광이의사") {
+            const isAttacked = Object.values(targets).some(at => at.to === t.to && at.role === "마피아");
+            if(!isAttacked) deaths.push(t.to); // 공격 안받았는데 힐하면 사망
+        }
+    });
+
+    // 결과 업데이트
+    db.ref(`rooms/${roomID}`).update({
+        phase: "MORNING",
+        targetList: null, // 초기화
+        lastDeaths: deaths
+    });
+}
+
+// --- [9] UI 업데이트 함수 ---
+function updateUI() {
+    const pList = document.getElementById('player-list');
+    pList.innerHTML = "";
+    
+    Object.keys(gameData.players).forEach(uid => {
+        const p = gameData.players[uid];
+        const card = document.createElement('div');
+        card.className = `player-card ${p.isAlive ? '' : 'dead'}`;
+        card.innerHTML = `<span>${uid}</span> <span class="badge">${p.isAlive ? '생존' : '사망'}</span>`;
+        
+        // 밤에 생존해있을 때 클릭하면 타겟 지정
+        if(gameData.phase === "NIGHT" && p.isAlive && uid !== myID) {
+            card.onclick = () => {
+                document.querySelectorAll('.player-card').forEach(c => c.classList.remove('selected'));
+                card.classList.add('selected');
+                useAbility(uid);
+            };
+        }
+        pList.appendChild(card);
+    });
+
+    // 내 정보 업데이트
+    if(gameData.players[myID]) {
+        document.getElementById('role-name').innerText = gameData.players[myID].role;
+        document.getElementById('role-desc').innerText = ROLES[gameData.players[myID].role].desc;
+    }
+}
+
+function getRandomWeather() {
+    const w = ["맑음", "황사", "정전", "한파", "홍수", "안개", "계엄령", "축제"];
+    return w[Math.floor(Math.random() * w.length)];
+}
